@@ -56,6 +56,18 @@ public class Robot {
 	private ArrayList<String> inventory = new ArrayList<>();
 	// field to store recent positions for loop detection
 	private List<Position> recentPositions = new ArrayList<>();
+	
+	// Performance optimization caches
+	private Map<Position, TileStatus> environmentCache = new HashMap<>();
+	private Map<String, List<Action>> pathCache = new HashMap<>();
+	private Map<Position, Map<Position, Integer>> distanceCache = new HashMap<>();
+	private long lastEnvironmentUpdate = 0;
+	private final long CACHE_VALIDITY_MS = 1000; // Cache valid for 1 second
+	private final int MAX_VISITED_POSITIONS = 1000; // Limit memory usage
+	private final int MAX_RECENT_POSITIONS = 8; // Reduced from 10
+	private int iterationCount = 0;
+	private Position lastProgressPosition = null;
+	private int progressStuckCounter = 0;
 
 	/**
 	 * Initializes a Robot on a specific tile in the environment.
@@ -121,19 +133,14 @@ public class Robot {
 			}
 
 			recentPositions.add(currentPos);
-			if (recentPositions.size() > 10) {
+			if (recentPositions.size() > MAX_RECENT_POSITIONS) {
 				recentPositions.remove(0);
 			}
 
-			// Check if we're stuck in a loop
-			boolean isStuck = false;
-			if (recentPositions.size() >= 6) {
-				Set<Position> uniquePositions = new HashSet<>(
-						recentPositions.subList(recentPositions.size() - 6, recentPositions.size()));
-				if (uniquePositions.size() <= 2) {
-					isStuck = true;
-					System.out.println("DETECTED STUCK CONDITION - trying alternative strategies");
-				}
+			// Use advanced stuck detection
+			boolean isStuck = isStuckAdvanced(currentPos);
+			if (isStuck) {
+				System.out.println("DETECTED STUCK CONDITION - trying alternative strategies");
 			}
 
 			// Check if we're at the goal and have collected all chips
@@ -330,9 +337,11 @@ public class Robot {
 			}
 
 			if (!chipPositions.isEmpty()) {
-				Position nearestChip = findNearestAccessibleTarget(currentPos, chipPositions);
-				if (nearestChip != null) {
-					generatePlan(currentPos, nearestChip);
+				// Use optimal target ordering for better efficiency
+				List<Position> orderedChips = getOptimalTargetOrder(currentPos, chipPositions);
+				if (!orderedChips.isEmpty()) {
+					Position targetChip = orderedChips.get(0); // Get the best first target
+					generatePlan(currentPos, targetChip);
 					if (!currentPlan.isEmpty()) {
 						return currentPlan.pop();
 					}
@@ -440,14 +449,16 @@ public class Robot {
 
 			if (!keyPositions.isEmpty()) {
 				System.out.println("Found " + keyPositions.size() + " keys to collect");
-				Position nearestKey = findNearestAccessibleTarget(currentPos, keyPositions);
-				if (nearestKey != null) {
-					System.out.println("Moving toward nearest key at " + nearestKey);
-					generatePlan(currentPos, nearestKey);
+				// Use optimal target ordering for keys too
+				List<Position> orderedKeys = getOptimalTargetOrder(currentPos, keyPositions);
+				if (!orderedKeys.isEmpty()) {
+					Position targetKey = orderedKeys.get(0);
+					System.out.println("Moving toward optimal key at " + targetKey);
+					generatePlan(currentPos, targetKey);
 					if (!currentPlan.isEmpty()) {
 						return currentPlan.pop();
 					} else {
-						System.out.println("Could not plan path to nearest key");
+						System.out.println("Could not plan path to target key");
 					}
 				} else {
 					System.out.println("No accessible keys found");
@@ -534,7 +545,7 @@ public class Robot {
 			}
 
 			recentPositions.add(currentPos);
-			if (recentPositions.size() > 10) {
+			if (recentPositions.size() > MAX_RECENT_POSITIONS) {
 				recentPositions.remove(0);
 			}
 
@@ -703,7 +714,7 @@ public class Robot {
 	 */
 	private void updateKnowledge() {
 		try {
-			// Update what we know about the environment from our current position
+			iterationCount++;
 			Position robotPos = env.getRobotPosition(this);
 			if (robotPos == null)
 				return;
@@ -714,8 +725,23 @@ public class Robot {
 			if (neighborTiles == null || neighborPositions == null)
 				return;
 
-			// Record our current position as visited
 			visitedPositions.add(robotPos);
+			
+			// Memory management - limit visited positions
+			if (visitedPositions.size() > MAX_VISITED_POSITIONS) {
+				// Remove oldest 20% of visited positions
+				Set<Position> oldVisited = new HashSet<>(visitedPositions);
+				visitedPositions.clear();
+				int keepCount = (int) (MAX_VISITED_POSITIONS * 0.8);
+				int count = 0;
+				for (Position pos : oldVisited) {
+					if (count++ >= keepCount) break;
+					visitedPositions.add(pos);
+				}
+			}
+
+			// Update environment cache if needed
+			updateEnvironmentCache();
 
 			// Update known tiles with neighbor information
 			for (Map.Entry<String, Position> entry : neighborPositions.entrySet()) {
@@ -726,6 +752,7 @@ public class Robot {
 					Tile tile = neighborTiles.get(direction);
 					if (tile != null) {
 						knownTiles.put(neighborPos, tile.getStatus());
+						environmentCache.put(neighborPos, tile.getStatus());
 					}
 				}
 			}
@@ -764,64 +791,26 @@ public class Robot {
 		}
 	}
 
-	private Position findNearestAccessibleTarget(Position start, List<Position> targets) {
-		if (start == null || targets == null || targets.isEmpty()) {
-			return null;
-		}
-
-		try {
-			Position nearest = null;
-			int shortestPathLength = Integer.MAX_VALUE;
-
-			for (Position target : targets) {
-				if (target == null)
-					continue;
-
-				List<Action> pathToTarget = planPath(start, target);
-				// Only consider this target if we actually found a path to it
-				if (pathToTarget != null && !pathToTarget.isEmpty() && pathToTarget.size() < shortestPathLength) {
-					shortestPathLength = pathToTarget.size();
-					nearest = target;
-				}
-			}
-
-			return nearest;
-		} catch (Exception e) {
-			System.out.println("Error in findNearestAccessibleTarget: " + e.getMessage());
-			return null;
-		}
-	}
 
 	private List<Action> planPath(Position start, Position goal) {
-		// A* pathfinding algorithm
 		if (start == null || goal == null) {
-			return new ArrayList<>(); // Return empty list if inputs are invalid
+			return new ArrayList<>();
 		}
 
 		try {
+			// Check path cache first
+			List<Action> cachedPath = getCachedPath(start, goal);
+			if (cachedPath != null) {
+				return new ArrayList<>(cachedPath);
+			}
+
 			PriorityQueue<Node> openSet = new PriorityQueue<>(Comparator.comparingInt(n -> n.fScore));
 			Map<Position, Node> nodeMap = new HashMap<>();
 			Set<Position> closedSet = new HashSet<>();
 
-			// Get tiles data that we know
-			Map<Position, TileStatus> tilesToUse = new HashMap<>(knownTiles); // Start with what we know
-
-			// Try to get more complete data if possible
-			try {
-				Map<Position, Tile> allTiles = env.getTiles();
-				if (allTiles != null) {
-					for (Map.Entry<Position, Tile> entry : allTiles.entrySet()) {
-						Position pos = entry.getKey();
-						Tile tile = entry.getValue();
-						if (tile != null) {
-							tilesToUse.put(pos, tile.getStatus());
-						}
-					}
-				}
-			} catch (Exception e) {
-				System.out.println("Error getting complete tiles data: " + e.getMessage());
-				// Continue with what we know
-			}
+			// Use cached environment data for better performance
+			Map<Position, TileStatus> tilesToUse = new HashMap<>(environmentCache);
+			tilesToUse.putAll(knownTiles); // Add any additional known tiles
 
 			Node startNode = new Node(start);
 			startNode.gScore = 0;
@@ -839,7 +828,9 @@ public class Robot {
 
 				if (current.position.equals(goal)) {
 					System.out.println("Path found in " + iterations + " iterations");
-					return reconstructPath(current);
+					List<Action> path = reconstructPath(current);
+					cachePath(start, goal, path); // Cache the computed path
+					return path;
 				}
 
 				closedSet.add(current.position);
@@ -1191,6 +1182,180 @@ public class Robot {
 			}
 		} catch (Exception e) {
 			System.out.println("Error checking adjacent position: " + e.getMessage());
+		}
+	}
+
+	// Performance optimization methods
+	
+	private void updateEnvironmentCache() {
+		try {
+			long currentTime = System.currentTimeMillis();
+			if (currentTime - lastEnvironmentUpdate > CACHE_VALIDITY_MS) {
+				environmentCache.clear();
+				
+				try {
+					Map<Position, Tile> allTiles = env.getTiles();
+					if (allTiles != null) {
+						for (Map.Entry<Position, Tile> entry : allTiles.entrySet()) {
+							Position pos = entry.getKey();
+							Tile tile = entry.getValue();
+							if (tile != null) {
+								environmentCache.put(pos, tile.getStatus());
+							}
+						}
+					}
+				} catch (Exception e) {
+					// If full environment access fails, use what we know
+					environmentCache.putAll(knownTiles);
+				}
+				
+				lastEnvironmentUpdate = currentTime;
+			}
+		} catch (Exception e) {
+			System.out.println("Error updating environment cache: " + e.getMessage());
+		}
+	}
+	
+	private List<Position> getOptimalTargetOrder(Position start, List<Position> targets) {
+		if (targets == null || targets.size() <= 1) {
+			return targets;
+		}
+		
+		try {
+			// Use nearest neighbor with 2-opt improvement for small sets
+			List<Position> orderedTargets = new ArrayList<>();
+			Set<Position> remaining = new HashSet<>(targets);
+			Position current = start;
+			
+			while (!remaining.isEmpty()) {
+				Position nearest = null;
+				int shortestDistance = Integer.MAX_VALUE;
+				
+				for (Position target : remaining) {
+					int distance = estimateDistance(current, target);
+					if (distance < shortestDistance) {
+						shortestDistance = distance;
+						nearest = target;
+					}
+				}
+				
+				if (nearest != null) {
+					orderedTargets.add(nearest);
+					remaining.remove(nearest);
+					current = nearest;
+				} else {
+					break;
+				}
+			}
+			
+			// Simple 2-opt improvement for small sets
+			if (orderedTargets.size() <= 5) {
+				orderedTargets = improve2Opt(start, orderedTargets);
+			}
+			
+			return orderedTargets;
+		} catch (Exception e) {
+			System.out.println("Error in getOptimalTargetOrder: " + e.getMessage());
+			return targets;
+		}
+	}
+	
+	private List<Position> improve2Opt(Position start, List<Position> tour) {
+		if (tour.size() <= 2) return tour;
+		
+		try {
+			List<Position> bestTour = new ArrayList<>(tour);
+			int bestDistance = calculateTourDistance(start, tour);
+			
+			for (int i = 0; i < tour.size() - 1; i++) {
+				for (int j = i + 2; j < tour.size(); j++) {
+					List<Position> newTour = new ArrayList<>(tour);
+					// Reverse the segment between i+1 and j
+					List<Position> segment = newTour.subList(i + 1, j + 1);
+					java.util.Collections.reverse(segment);
+					
+					int newDistance = calculateTourDistance(start, newTour);
+					if (newDistance < bestDistance) {
+						bestDistance = newDistance;
+						bestTour = newTour;
+					}
+				}
+			}
+			
+			return bestTour;
+		} catch (Exception e) {
+			return tour;
+		}
+	}
+	
+	private int calculateTourDistance(Position start, List<Position> tour) {
+		if (tour.isEmpty()) return 0;
+		
+		int totalDistance = estimateDistance(start, tour.get(0));
+		for (int i = 0; i < tour.size() - 1; i++) {
+			totalDistance += estimateDistance(tour.get(i), tour.get(i + 1));
+		}
+		return totalDistance;
+	}
+	
+	private boolean isStuckAdvanced(Position currentPos) {
+		try {
+			// Progress-based stuck detection
+			if (lastProgressPosition == null) {
+				lastProgressPosition = currentPos;
+				progressStuckCounter = 0;
+				return false;
+			}
+			
+			int distanceFromLastProgress = estimateDistance(currentPos, lastProgressPosition);
+			
+			// If we've moved significantly, reset progress tracking
+			if (distanceFromLastProgress > 3) {
+				lastProgressPosition = currentPos;
+				progressStuckCounter = 0;
+				return false;
+			}
+			
+			// Increment stuck counter if we haven't made progress
+			progressStuckCounter++;
+			
+			// Consider stuck if no progress for many iterations
+			boolean progressStuck = progressStuckCounter > 15;
+			
+			// Also check position-based stuck detection (existing logic)
+			boolean positionStuck = false;
+			if (recentPositions.size() >= 6) {
+				Set<Position> uniquePositions = new HashSet<>(
+					recentPositions.subList(recentPositions.size() - 6, recentPositions.size()));
+				positionStuck = uniquePositions.size() <= 2;
+			}
+			
+			return progressStuck || positionStuck;
+		} catch (Exception e) {
+			return false;
+		}
+	}
+	
+	private String getCacheKey(Position start, Position goal) {
+		return start.getRow() + "," + start.getCol() + "->" + goal.getRow() + "," + goal.getCol();
+	}
+	
+	private List<Action> getCachedPath(Position start, Position goal) {
+		String key = getCacheKey(start, goal);
+		return pathCache.get(key);
+	}
+	
+	private void cachePath(Position start, Position goal, List<Action> path) {
+		String key = getCacheKey(start, goal);
+		if (path != null && !path.isEmpty()) {
+			pathCache.put(key, new ArrayList<>(path));
+			
+			// Limit cache size
+			if (pathCache.size() > 100) {
+				// Remove oldest entries (simple FIFO, could be improved with LRU)
+				String firstKey = pathCache.keySet().iterator().next();
+				pathCache.remove(firstKey);
+			}
 		}
 	}
 
